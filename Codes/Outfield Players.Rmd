@@ -1,0 +1,1566 @@
+---
+title: "proj_2"
+output: html_document
+date: "2023-12-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, include=FALSE}
+library(dplyr)
+library(lmtest)
+library(fastDummies)
+library(glmnet)
+library(corrplot)
+library(caret)
+library(tensorflow)
+library(keras)
+library(gglasso)
+library(car)
+library(sparsepca)
+library(ggplot2)
+library(FactoMineR)
+```
+
+
+```{r}
+df <- read.csv("/Users/pietrovolpato/Desktop/UNIPD/STATISTICAL/cleaned_dataset.csv")
+dim(df)
+```
+
+```{r}
+country_to_cont <- read.csv("/Users/pietrovolpato/Downloads/Country_to_cont.csv", sep = ";")
+continent <- c()
+len = 0
+for (i in df$nationality){
+  temp <- substr(i, start = nchar(i)-2, nchar(i))
+  if (temp %in% country_to_cont$Code){
+    continent <- c(continent, country_to_cont[country_to_cont$Code == temp,"Continent"])  
+  }
+  else{
+    continent <- c(continent, NA)
+  }
+}
+df$continent <- continent
+
+missing <- unique(df[is.na(df$continent),"nationality"]) 
+length(missing)
+```
+
+
+```{r}
+df <- dummy_cols(df, select_columns = "continent", remove_first_dummy = TRUE)
+df <- select(df, -c("nationality","continent"))
+```
+
+```{r}
+df <- dummy_cols(df, select_columns = "league", remove_first_dummy = TRUE)
+df <- select(df, -c("squad", "league"))
+```
+
+
+# Division per role
+
+```{r}
+df_df <- df[df$position=="DF",]
+mf_df <- df[df$position=="MF",]
+fw_df <- df[df$position=="FW",]
+```
+
+## Forwards
+```{r}
+fw_df <- fw_df[,-2]
+rownames(fw_df) <- NULL
+```
+
+
+```{r,fig.width=10,fig.height=5}
+par(mfrow=c(1,2))
+plot(density(fw_df$value), main = "Density of value")
+plot(density(log(fw_df$value)), main = "Density of log-value")
+```
+From some preliminary analysis we observed that using the log of the value improves our performances and results.
+```{r}
+fw_df$value <- log(fw_df$value)
+```
+### Linear model
+```{r}
+model <- lm(value~.-player, data = fw_df)
+plot(model)
+```
+### Linear regularized model
+
+The model showed above is comprehensive of all variables on hand, which are almost 200, so some regularization might be needed to ease the dimensioanlity of our problem and apply some feature selection to understand which variables are less relevant for our problem. 
+To do so we fristy need to scale our data, divide into train and test, and apply cv to find the best λ value.
+
+We removed the CL_best scorer because only one player has value = 1, so scaling the training and test will lead to a columm full of NAs given that it is a column composed only by zeros. 
+```{r}
+fw_df <- select(fw_df, -c("CLBestScorer"))
+fw_df <- select(fw_df, -c("blocked_shots_saves"))
+```
+
+We can now divide intro train and test with a 80/20 split. After splitting the dataset we will scale the numerical variables, keeping untouched the response variable. 
+```{r}
+set.seed(1812)
+idxs <- sample(1:nrow(fw_df), floor(nrow(fw_df)*0.8))
+train <- fw_df[idxs, ]
+test <- fw_df[-idxs,]
+```
+
+```{r}
+train_scaled <- train
+test_scaled <- test
+```
+
+```{r}
+train_scaled[,-c(1,3)] <- scale(train[,-c(1,3)])
+test_scaled[,-c(1,3)] <- scale(test[,-c(1,3)])
+```
+
+Before training our model using cv we can train it using different lambdas and observe the behavior of coefficients.
+
+```{r}
+model_for_plot <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train$value)
+plot(model_for_plot, xvar="lambda", main="model coefficient paths") 
+```
+We can observe how in the (-6, -4) range most of the coefficients tend to go to 0. This indicates that even for relatively small lambdas we have a strong regularization, indicating the weakness of some variables. 
+
+
+After dividing we can apply the cv process to the training set, which will be divided intro train and validation, to find the best value of lambda for the regression. 
+
+```{r}
+set.seed(123)
+fw_cv <- cv.glmnet(as.matrix(train_scaled[,-c(1,3)]), train$value)
+plot(fw_cv, xlim=c(-0,-8), ylim = c(0,10)) #zoom
+```
+
+```{r}
+paste("Lambda 1se:",round(fw_cv$lambda.1se,7))
+paste("Lambda min:",round(fw_cv$lambda.min,7))
+```
+
+We will go with the lambda_min since it returns the minimum error. 
+
+```{r}
+model <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train_scaled$value, lambda = fw_cv$lambda.min, alpha = 1)
+```
+
+After training the model we can make predictions on the test set.
+
+```{r}
+predictions <- predict(model, newx =  as.matrix(test_scaled[,-c(1,3)]))
+mse <- mean((predictions - test$value)^2)
+mae <- mean(abs(predictions - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+```{r}
+lmbda <- fw_cv$lambda.1se
+lmbda1 <- fw_cv$lambda.min
+plt <- cbind(test$value, predict(object=fw_cv, newx=as.matrix(test_scaled[,-c(1,3)])), predict(object=fw_cv, newx=as.matrix(test_scaled[,-c(1,3)]), s=lmbda1), type='link')
+matplot(plt, main="Predicted vs Actual", type='l', lwd=2, 
+        ylab="Value",
+        xlab="Players",
+        col = c("#000000", "#009490", "#BDC2C5"),
+)
+grid()
+legend("bottomright", legend=c("Actual","Fitted-1se","Fitted-min"), fill=c("#000000", "#009490", "#BDC2C5"), bty="n", cex=0.7)
+```
+
+We can now observe all the coefficients our model, trained with lambda.min, leaves different from 0. We can see how most of them are related to offensive apsects of the footbal game, coherent with the position we are analyzing. 
+
+```{r}
+a <- rownames(coef(fw_cv, s = 'lambda.min'))[coef(fw_cv, s = 'lambda.min')[,1]!= 0] ### returns nonzero coefs
+```
+```{r}
+b <- coef(fw_cv, s = 'lambda.min')[coef(fw_cv, s = 'lambda.min')[,1]!= 0] ### returns nonzero coefs
+coefs_fw <- data.frame(Column1 = a, Column2 = b)
+```
+
+### L2 regularization
+```{r}
+model_for_plot_l2 <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train$value, alpha = 0)
+plot(model_for_plot_l2, xvar="lambda", main="model coefficient paths - L2") 
+```
+
+```{r}
+set.seed(123)
+fw_cv_l2 <- cv.glmnet(as.matrix(train_scaled[,-c(1,3)]), train$value, alpha = 0)
+plot(fw_cv_l2)
+```
+
+```{r}
+paste("Lambda 1se:",round(fw_cv_l2$lambda.1se,7))
+paste("Lambda min:",round(fw_cv_l2$lambda.min,7))
+```
+
+We will go with the lambda_min since it returns the minimum error. 
+
+```{r}
+model_l2 <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train_scaled$value, lambda = fw_cv_l2$lambda.min, alpha = 0)
+```
+
+After training the model we can make predictions on the test set.
+
+```{r}
+predictions_l2 <- predict(model_l2, newx =  as.matrix(test_scaled[,-c(1,3)]))
+mse <- mean((predictions_l2 - test$value)^2)
+mae <- mean(abs(predictions_l2 - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_l2)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+The model performs worlsy than the L1-regularized model.
+
+## PCA
+We can try another way to make inference on our data, by reducing dimension of our problem using the PCA. 
+
+```{r}
+pca_result <- prcomp(train[,-c(1,3)], scale = TRUE)
+train_pca <- predict(pca_result, newdata = train[,-c(1,3)])
+
+# Scree plot
+scree_data <- cumsum(pca_result$sdev^2) / sum(pca_result$sdev^2)*100
+```
+
+
+```{r}
+for(i in 1:length(scree_data)){
+  if (scree_data[i]>95){
+    line_95_h <- scree_data[i]
+    line_95_v <- i
+    break
+  }
+}
+
+for(i in 1:length(scree_data)){
+  if (scree_data[i]>90){
+    line_90_h <- scree_data[i]
+    line_90_v <- i
+    break
+  }
+}
+
+# Create a scree plot
+scree_plot <- ggplot(data.frame(PC = 1:length(scree_data), ExplainedVariance = scree_data),
+                     aes(x = PC, y = ExplainedVariance)) +
+  geom_bar(stat = "identity", fill = "skyblue", width = 0.7) +
+  geom_line(color = "blue") +
+  labs(title = "Scree Plot",
+       x = "Principal Component",
+       y = "Explained Variance") +
+  theme_minimal() + 
+geom_segment(
+    aes(x = line_95_v, y = -Inf, xend = line_95_v, yend = line_95_h),
+    linetype = "dashed", color = "darkblue", linewidth = 0.5
+  )+
+  geom_segment(
+    aes(x = -Inf, y = line_95_h, xend = line_95_v, yend = line_95_h),
+    linetype = "dashed", color = "darkblue", linewidth = 0.5
+  )+ 
+geom_segment(
+    aes(x = line_90_v, y = -Inf, xend = line_90_v, yend = line_90_h),
+    linetype = "dashed", color = "black", linewidth = 0.5
+  )+
+  geom_segment(
+    aes(x = -Inf, y = line_90_h, xend = line_90_v, yend = line_90_h),
+    linetype = "dashed", color = "black", linewidth = 0.5
+  )
+  
+
+print(scree_plot)
+```
+We can select the number of principal components based on the amount of variance explained.
+```{r}
+paste("PC for a 90% variance:",line_90_v)
+paste("PC for a 95% variance:",line_95_v)
+```
+We can select the number of componenets to be equal to 87, explaining 95% of the variance. Now that we have reduced the dimension of our problem by appying the pca
+
+```{r}
+num_components <- line_95_v
+selected_components <- train_pca[, 1:num_components]
+```
+
+```{r}
+model_95 <- lm(train$value~., data = data.frame(selected_components))
+plot(model_95)
+```
+We can now prepare the test set in the same way we prepared our training to test the performances of our model. 
+
+```{r}
+test_pca <- predict(pca_result, newdata = test[,-c(1,3)])[, 1:num_components]
+predictions_pca <- predict(model_95, newdata = data.frame(test_pca))
+mse <- mean((predictions_pca - test$value)^2)
+mae <- mean(abs(predictions_pca - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_pca)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+We can try the same approach with fewer components
+```{r}
+num_components <- line_90_v
+selected_components <- train_pca[, 1:num_components]
+```
+
+```{r}
+model_90 <- lm(train$value~., data = data.frame(selected_components))
+plot(model_90)
+```
+
+```{r}
+test_pca <- predict(pca_result, newdata = test[,-c(1,3)])[, 1:num_components]
+predictions_pca <- predict(model_90, newdata = data.frame(test_pca))
+mse <- mean((predictions_pca - test$value)^2)
+mae <- mean(abs(predictions_pca - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_pca)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+We can see how it performs better with fewer principal componenets.
+
+
+
+### Sparse PCA
+
+We can introduce the concept of sparsity also in the PCA.
+```{r}
+var.sp<- NULL
+alphas<- seq(0,0.15, length=20)
+j<-1
+for(i in alphas){
+  fit <- spca(train[,-c(1,3)], k=line_95_v, alpha= i,  scale=TRUE, verbose=F)
+  var.sp[j]<-sum(fit$sdev^2)
+  print(c(i, sum(fit$sdev^2)))	
+  j<-j+1
+}
+par(mfrow=c(1,1))
+plot(alphas, var.sp, type="l", xlab=expression(lambda[1]), ylab="Explained variance", lwd=2)
+abline(v = alphas[4], col = "red")
+```
+
+```{r}
+fit <- spca(train[,-c(1,3)], k=line_95_v, alpha= alphas[4],   scale=TRUE, verbose=F)
+
+V <- fit$loadings
+
+pcData <- as.data.frame(scale(train[,-c(1,3)]) %*% V)
+m1 <- lm(train$value~., pcData)
+#library(hdrm)
+#CIplot(m1, tau=c(-1,-1,-1,-1,-1), sort=FALSE, xlab=expression(beta))
+```
+
+```{r}
+plot(m1)
+```
+
+```{r}
+fit_test <- spca(test[,-c(1,3)], k=line_95_v, alpha= alphas[4],   scale=TRUE, verbose=F)
+V_test <- fit_test$loadings
+pcTest <- as.data.frame(scale(test[,-c(1,3)]) %*% V_test)
+
+
+predictions <- predict(m1, newdata = pcTest)
+mse <- mean((predictions - test$value)^2)
+mae <- mean(abs(predictions - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+
+
+
+### Groups
+
+We can now try the grouped-lasso regression algorithm, dividing our variables into 23 different categories
+```{r}
+train_players <- train_scaled$player
+test_players <- test_scaled$player
+
+
+train_y <- train_scaled$value
+test_y <- test_scaled$value
+
+train_scaled <- train_scaled[,-c(1,3)]
+
+test_scaled <- test_scaled[,-c(1,3)]
+```
+
+```{r}
+reference <- c('pen'= 1, 'goal'= 2, 'pass'= 3,'x'= 4,'sca'= 5,'gca'= 6,'shot'= 7,'touch'= 8,'tackle'= 9,'cross'= 10,'dribble'= 11,'distance'= 12, "continent" = 13, "league" = 13, "age" = 13,"height" = 13, "foot" = 13,"aerials"=14,"pressure"=15,"cards"=16,"corner"=17,"assist" = 18,"through_balls"=18, "minutes" = 19,"games_started_pct"=19,"D"=20,"Pts"=20,"CL"=20,"WinCL"=20, "foul" = 21,"blocks"=22,"interceptions"=22,"clearances"=22,"throw_ins"=22, "miscontrols"=22,"ball_recoveries"=22,"errors"=23, "nutmegs"=23, "dispossessed"=23,"offsides"=23, "own_goal" = 23)
+groups <- rep(0, dim(train_scaled)[2])
+```
+
+We can now create the vector of groups
+
+```{r}
+idx <- 1
+
+for (col in colnames(train_scaled)){
+  for (key in names(reference)){
+    if (grepl(key,col)){
+      groups[idx] <- reference[key]
+    }
+  }
+  idx <- idx + 1
+}
+```
+
+convert it into integers
+
+```{r}
+groups_int <- c()
+for (i in groups){
+  groups_int <- c(groups_int, as.integer(i))
+}
+```
+
+re-order columns accordingly to the group they belong: the algorithm requires the groups to be sequential
+
+```{r}
+new_cols <- c()
+for (i in 1:23){
+  idx <- 1
+  for (col in colnames(train_scaled)){
+    if (groups[idx] == i){
+      new_cols <- c(new_cols,col)
+    }
+    idx <- idx + 1
+  }
+}
+```
+
+```{r}
+train_scaled <- train_scaled[,new_cols]
+test_scaled <- test_scaled[,new_cols]
+```
+
+```{r}
+groups_int <- sort(groups_int)
+```
+
+### General
+```{r}
+geenral_group <- gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls')
+coef.mat=geenral_group$beta
+#
+plot(geenral_group)
+
+behavior <- c()
+for(i in 1:23){
+  idx <- match(i, groups_int)
+  behavior <- c(behavior,max(which(coef.mat[idx,]==0)))
+}
+
+100 - behavior
+```
+
+In the behavior vector we can observe the number of models in which each group is active.
+
+After it we can apply cross validation to find the best value of lambda
+```{r}
+cv.group <- cv.gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls', nfolds = 10)
+plot(cv.group)
+```
+
+```{r}
+group_model <- gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls', lambda = cv.group$lambda.1se)
+group_model2 <- gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls', lambda = cv.group$lambda.min)
+```
+
+```{r}
+coef_min <- rownames(coef(cv.group, s = 'lambda.min'))[coef(cv.group, s = 'lambda.min')[,1]!= 0]
+coef_1se <- rownames(coef(cv.group, s = 'lambda.1se'))[coef(cv.group, s = 'lambda.1se')[,1]!= 0]
+setdiff(coef_min, coef_1se)
+```
+sca : 5
+gca: 6
+cross : 10
+defensive: 22
+negative : 23
+```{r}
+predictions_group <- predict(object = group_model2, newx = test_scaled)
+mse <- mean((predictions_group - test$value)^2)
+mae <- mean(abs(predictions_group - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_group)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+## NN
+
+```{r, include = False}
+#install_tensorflow()
+model <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = ncol(train_scaled), kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 32, activation = "relu", kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 1)  # Output layer for regression
+
+custom_learning_rate <- 0.01
+
+# Compile the model with the Adam optimizer and custom learning rate
+model %>% compile(
+  loss = "mean_squared_error",
+  optimizer = optimizer_adam(learning_rate = custom_learning_rate),
+  metrics = c("mean_absolute_error")
+)
+
+history <- model %>%
+  fit(
+    x = as.matrix(train_scaled),
+    y = train_y,
+    epochs = 250,
+    batch_size = 32,
+    validation_split = 0.2,
+  )
+
+```
+```{r}
+predictions_nn <- predict(model,  as.matrix( test_scaled))
+
+mse <- mean((predictions_nn - test$value)^2)
+mae <- mean(abs(predictions_nn - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_nn)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+
+## Midfielders
+```{r}
+mf_df <- mf_df[,-2]
+rownames(mf_df) <- NULL
+```
+
+```{r}
+mf_df <- mf_df %>% select(-c("continent_Oceania","continent_Asia"))
+```
+
+
+```{r,fig.width=10,fig.height=5}
+par(mfrow=c(1,2))
+plot(density(mf_df$value), main = "Density of value")
+plot(density(log(mf_df$value)), main = "Density of log-value")
+```
+From some preliminary analysis we observed that using the log of the value improves our performances and results.
+```{r}
+mf_df$value <- log(mf_df$value)
+```
+
+
+### Linear model
+```{r}
+model <- lm(value~.-player, data = mf_df)
+plot(model)
+```
+### Linear regularized model
+
+The model showed above is comprehensive of all variables on hand, which are almost 200, so some regularization might be needed to ease the dimensioanlity of our problem and apply some feature selection to understand which variables are less relevant for our problem. 
+To do so we fristy need to scale our data, divide into train and test, and apply cv to find the best λ value.
+
+We removed the CL_best scorer because only one player has value = 1, so scaling the training and test will lead to a columm full of NAs given that it is a column composed only by zeros. 
+```{r}
+mf_df <- select(mf_df, -c("CLBestScorer"))
+mf_df <- select(mf_df, -c("blocked_shots_saves"))
+```
+
+We can now divide intro train and test with a 80/20 split. After splitting the dataset we will scale the numerical variables, keeping untouched the response variable. 
+```{r}
+set.seed(1812)
+idxs <- sample(1:nrow(mf_df), floor(nrow(mf_df)*0.8))
+train <- mf_df[idxs, ]
+test <- mf_df[-idxs,]
+```
+
+```{r}
+train_scaled <- train
+test_scaled <- test
+```
+
+```{r}
+train_scaled[,-c(1,3)] <- scale(train[,-c(1,3)])
+test_scaled[,-c(1,3)] <- scale(test[,-c(1,3)])
+```
+
+Before training our model using cv we can train it using different lambdas and observe the behavior of coefficients.
+
+```{r}
+model_for_plot <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train$value)
+plot(model_for_plot, xvar="lambda", main="model coefficient paths") 
+```
+
+
+After dividing we can apply the cv process to the training set, which will be divided intro train and validation, to find the best value of lambda for the regression. 
+
+```{r}
+set.seed(123)
+mf_cv <- cv.glmnet(as.matrix(train_scaled[,-c(1,3)]), train$value)
+plot(mf_cv, xlim=c(-0,-8), ylim = c(0,10)) #zoom
+```
+
+```{r}
+paste("Lambda 1se:",round(mf_cv$lambda.1se,7))
+paste("Lambda min:",round(mf_cv$lambda.min,7))
+```
+
+We will go with the lambda_min since it returns the minimum error. 
+
+```{r}
+model <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train_scaled$value, lambda = mf_cv$lambda.min, alpha = 1)
+```
+
+After training the model we can make predictions on the test set.
+
+```{r}
+predictions <- predict(model, newx =  as.matrix(test_scaled[,-c(1,3)]))
+mse <- mean((predictions - test$value)^2)
+mae <- mean(abs(predictions - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+We can now observe all the coefficients our model, trained with lambda.min, leaves different from 0. 
+
+```{r}
+a <- rownames(coef(mf_cv, s = 'lambda.min'))[coef(mf_cv, s = 'lambda.min')[,1]!= 0] ### returns nonzero coefs
+```
+```{r}
+b <- coef(mf_cv, s = 'lambda.min')[coef(mf_cv, s = 'lambda.min')[,1]!= 0] ### returns nonzero coefs
+coefs_mf <- data.frame(Column1 = a, Column2 = b)
+```
+
+```{r}
+lmbda <- mf_cv$lambda.1se
+lmbda1 <- mf_cv$lambda.min
+plt <- cbind(test$value, predict(object=mf_cv, newx=as.matrix(test_scaled[,-c(1,3)])), predict(object=mf_cv, newx=as.matrix(test_scaled[,-c(1,3)]), s=lmbda1), type='link')
+matplot(plt, main="Predicted vs Actual", type='l', lwd=2, 
+        ylab="Value",
+        xlab="Players",
+        col = c("#000000", "#009490", "#BDC2C5"),
+)
+grid()
+legend("bottomright", legend=c("Actual","Fitted-1se","Fitted-min"), fill=c("#000000", "#009490", "#BDC2C5"), bty="n", cex=0.7)
+```
+### L2 regularization
+
+```{r}
+model_for_plot_l2 <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train$value, alpha = 0)
+plot(model_for_plot_l2, xvar="lambda", main="model coefficient paths - L2") 
+```
+
+```{r}
+set.seed(123)
+mf_cv_l2 <- cv.glmnet(as.matrix(train_scaled[,-c(1,3)]), train$value, alpha = 0)
+plot(mf_cv_l2)
+```
+
+```{r}
+paste("Lambda 1se:",round(mf_cv_l2$lambda.1se,7))
+paste("Lambda min:",round(mf_cv_l2$lambda.min,7))
+```
+
+We will go with the lambda_min since it returns the minimum error. 
+
+```{r}
+model_l2 <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train_scaled$value, lambda = mf_cv_l2$lambda.min, alpha = 0)
+```
+
+After training the model we can make predictions on the test set.
+
+```{r}
+predictions_l2 <- predict(model_l2, newx =  as.matrix(test_scaled[,-c(1,3)]))
+mse <- mean((predictions_l2 - test$value)^2)
+mae <- mean(abs(predictions_l2 - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_l2)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+The model performs wors than the L1-regularized model.
+
+## PCA
+We can try another way to make inference on our data, by reducing dimension of our problem using the PCA. 
+
+```{r}
+pca_result <- prcomp(train[,-c(1,3)], scale = TRUE)
+train_pca <- predict(pca_result, newdata = train[,-c(1,3)])
+
+# Scree plot
+scree_data <- cumsum(pca_result$sdev^2) / sum(pca_result$sdev^2)*100
+```
+
+
+```{r}
+for(i in 1:length(scree_data)){
+  if (scree_data[i]>95){
+    line_95_h <- scree_data[i]
+    line_95_v <- i
+    break
+  }
+}
+
+for(i in 1:length(scree_data)){
+  if (scree_data[i]>90){
+    line_90_h <- scree_data[i]
+    line_90_v <- i
+    break
+  }
+}
+
+# Create a scree plot
+scree_plot <- ggplot(data.frame(PC = 1:length(scree_data), ExplainedVariance = scree_data),
+                     aes(x = PC, y = ExplainedVariance)) +
+  geom_bar(stat = "identity", fill = "skyblue", width = 0.7) +
+  geom_line(color = "red") +
+  labs(title = "Scree Plot",
+       x = "Principal Component",
+       y = "Explained Variance") +
+  theme_minimal() + 
+geom_segment(
+    aes(x = line_95_v, y = -Inf, xend = line_95_v, yend = line_95_h),
+    linetype = "dashed", color = "red", linewidth = 0.5
+  )+
+  geom_segment(
+    aes(x = -Inf, y = line_95_h, xend = line_95_v, yend = line_95_h),
+    linetype = "dashed", color = "red", linewidth = 0.5
+  )+ 
+geom_segment(
+    aes(x = line_90_v, y = -Inf, xend = line_90_v, yend = line_90_h),
+    linetype = "dashed", color = "black", linewidth = 0.5
+  )+
+  geom_segment(
+    aes(x = -Inf, y = line_90_h, xend = line_90_v, yend = line_90_h),
+    linetype = "dashed", color = "black", linewidth = 0.5
+  )
+  
+
+print(scree_plot)
+```
+We can select the number of principal components based on the amount of variance explained.
+```{r}
+paste("PC for a 90% variance:",line_90_v)
+paste("PC for a 95% variance:",line_95_v)
+```
+We can select the number of componenets to be equal to 87, explaining 95% of the variance. Now that we have reduced the dimension of our problem by appying the pca
+
+```{r}
+num_components <- line_95_v
+selected_components <- train_pca[, 1:num_components]
+```
+
+```{r}
+model_95 <- lm(train$value~., data = data.frame(selected_components))
+plot(model_95)
+```
+We can now prepare the test set in the same way we prepared our training to test the performances of our model. 
+
+```{r}
+test_pca <- predict(pca_result, newdata = test[,-c(1,3)])[, 1:num_components]
+predictions_pca <- predict(model_95, newdata = data.frame(test_pca))
+mse <- mean((predictions_pca - test$value)^2)
+mae <- mean(abs(predictions_pca - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_pca)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+We can try the same approach with fewer components
+```{r}
+num_components <- line_90_v
+selected_components <- train_pca[, 1:num_components]
+```
+
+```{r}
+model_90 <- lm(train$value~., data = data.frame(selected_components))
+plot(model_90)
+```
+
+```{r}
+test_pca <- predict(pca_result, newdata = test[,-c(1,3)])[, 1:num_components]
+predictions_pca <- predict(model_90, newdata = data.frame(test_pca))
+mse <- mean((predictions_pca - test$value)^2)
+mae <- mean(abs(predictions_pca - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_pca)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+We can see how it performs better with fewer principal componenets.
+
+
+### Sparse PCA
+
+We can introduce the concept of sparsity also in the PCA.
+```{r}
+var.sp<- NULL
+alphas<- seq(0,0.15, length=20)
+j<-1
+for(i in alphas){
+  fit <- spca(train[,-c(1,3)], k=line_95_v, alpha= i,  scale=TRUE, verbose=F)
+  var.sp[j]<-sum(fit$sdev^2)
+  print(c(i, sum(fit$sdev^2)))	
+  j<-j+1
+}
+par(mfrow=c(1,1))
+plot(alphas, var.sp, type="l", xlab=expression(lambda[1]), ylab="Explained variance", lwd=2)
+abline(v = alphas[4], col = "red")
+```
+
+```{r}
+fit <- spca(train[,-c(1,3)], k=line_95_v, alpha= alphas[4],   scale=TRUE, verbose=F)
+
+V <- fit$loadings
+
+pcData <- as.data.frame(scale(train[,-c(1,3)]) %*% V)
+m1 <- lm(train$value~., pcData)
+#library(hdrm)
+#CIplot(m1, tau=c(-1,-1,-1,-1,-1), sort=FALSE, xlab=expression(beta))
+```
+
+```{r}
+plot(m1)
+```
+
+```{r}
+fit_test <- spca(test[,-c(1,3)], k=line_95_v, alpha= alphas[4],   scale=TRUE, verbose=F)
+V_test <- fit_test$loadings
+pcTest <- as.data.frame(scale(test[,-c(1,3)]) %*% V_test)
+
+
+predictions <- predict(m1, newdata = pcTest)
+mse <- mean((predictions - test$value)^2)
+mae <- mean(abs(predictions - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+
+
+### Groups
+
+We can now try the grouped-lasso regression algorithm, dividing our variables into 23 different categories
+```{r}
+train_players <- train_scaled$player
+test_players <- test_scaled$player
+
+
+train_y <- train_scaled$value
+test_y <- test_scaled$value
+
+train_scaled <- train_scaled[,-c(1,3)]
+
+test_scaled <- test_scaled[,-c(1,3)]
+```
+
+```{r}
+reference <- c('pen'= 1, 'goal'= 2, 'pass'= 3,'x'= 4,'sca'= 5,'gca'= 6,'shot'= 7,'touch'= 8,'tackle'= 9,'cross'= 10,'dribble'= 11,'distance'= 12, "continent" = 13, "league" = 13, "age" = 13,"height" = 13, "foot" = 13,"aerials"=14,"pressure"=15,"cards"=16,"corner"=17,"assist" = 18,"through_balls"=18, "minutes" = 19,"games_started_pct"=19,"D"=20,"Pts"=20,"CL"=20,"WinCL"=20, "foul" = 21,"blocks"=22,"interceptions"=22,"clearances"=22,"throw_ins"=22, "miscontrols"=22,"ball_recoveries"=22,"errors"=23, "nutmegs"=23, "dispossessed"=23,"offsides"=23, "own_goal" = 23)
+groups <- rep(0, dim(train_scaled)[2])
+```
+
+We can now create the vector of groups
+
+```{r}
+idx <- 1
+
+for (col in colnames(train_scaled)){
+  for (key in names(reference)){
+    if (grepl(key,col)){
+      groups[idx] <- reference[key]
+    }
+  }
+  idx <- idx + 1
+}
+```
+
+convert it into integers
+
+```{r}
+groups_int <- c()
+for (i in groups){
+  groups_int <- c(groups_int, as.integer(i))
+}
+```
+
+re-order columns accordingly to the group they belong: the algorithm requires the groups to be sequential
+
+```{r}
+new_cols <- c()
+for (i in 1:23){
+  idx <- 1
+  for (col in colnames(train_scaled)){
+    if (groups[idx] == i){
+      new_cols <- c(new_cols,col)
+    }
+    idx <- idx + 1
+  }
+}
+```
+
+```{r}
+train_scaled <- train_scaled[,new_cols]
+test_scaled <- test_scaled[,new_cols]
+```
+
+```{r}
+groups_int <- sort(groups_int)
+```
+
+### General
+```{r}
+geenral_group <- gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls')
+coef.mat=geenral_group$beta
+#
+plot(geenral_group)
+
+behavior <- c()
+for(i in 1:23){
+  idx <- match(i, groups_int)
+  behavior <- c(behavior,max(which(coef.mat[idx,]==0)))
+}
+
+100 - behavior
+```
+
+In the behavior vector we can observe the number of models in which each group is active.
+
+After it we can apply cross validation to find the best value of lambda
+```{r}
+cv.group <- cv.gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls', nfolds = 10)
+plot(cv.group)
+```
+
+```{r}
+group_model <- gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls', lambda = cv.group$lambda.1se)
+group_model2 <- gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls', lambda = cv.group$lambda.min)
+```
+
+```{r}
+coef_min <- rownames(coef(cv.group, s = 'lambda.min'))[coef(cv.group, s = 'lambda.min')[,1]!= 0]
+coef_1se <- rownames(coef(cv.group, s = 'lambda.1se'))[coef(cv.group, s = 'lambda.1se')[,1]!= 0]
+setdiff(coef_min, coef_1se)
+```
+
+```{r}
+predictions_group <- predict(object = group_model2, newx = test_scaled)
+mse <- mean((predictions_group - test$value)^2)
+mae <- mean(abs(predictions_group - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_group)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+## NN
+
+```{r}
+model <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = ncol(train_scaled), kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 32, activation = "relu", kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 1)  # Output layer for regression
+
+custom_learning_rate <- 0.01
+
+# Compile the model with the Adam optimizer and custom learning rate
+model %>% compile(
+  loss = "mean_squared_error",
+  optimizer = optimizer_adam(learning_rate = custom_learning_rate),
+  metrics = c("mean_absolute_error")
+)
+
+history <- model %>%
+  fit(
+    x = as.matrix(train_scaled),
+    y = train_y,
+    epochs = 250,
+    batch_size = 32,
+    validation_split = 0.2,
+  )
+```
+
+
+```{r}
+predictions <- predict(model, as.matrix(test_scaled))
+mse <- mean((predictions - test$value)^2)
+mae <- mean(abs(predictions - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+## Defenders
+```{r}
+df_df <- df_df[,-2]
+rownames(df_df) <- NULL
+```
+
+```{r}
+df_df <- df_df %>% select(-c("continent_Oceania","continent_Asia"))
+```
+
+
+```{r,fig.width=10,fig.height=5}
+par(mfrow=c(1,2))
+plot(density(df_df$value), main = "Density of value")
+plot(density(log(df_df$value)), main = "Density of log-value")
+```
+From some preliminary analysis we observed that using the log of the value improves our performances and results.
+```{r}
+df_df$value <- log(df_df$value)
+```
+
+
+### Linear model
+```{r}
+model <- lm(value~.-player, data = df_df)
+plot(model)
+```
+### Linear regularized model
+
+The model showed above is comprehensive of all variables on hand, which are almost 200, so some regularization might be needed to ease the dimensioanlity of our problem and apply some feature selection to understand which variables are less relevant for our problem. 
+To do so we fristy need to scale our data, divide into train and test, and apply cv to find the best λ value.
+
+We removed the CL_best scorer because only one player has value = 1, so scaling the training and test will lead to a columm full of NAs given that it is a column composed only by zeros. 
+```{r}
+df_df <- select(df_df, -c("CLBestScorer"))
+df_df <- select(df_df, -c("blocked_shots_saves"))
+```
+
+We can now divide intro train and test with a 80/20 split. After splitting the dataset we will scale the numerical variables, keeping untouched the response variable. 
+```{r}
+set.seed(1812)
+idxs <- sample(1:nrow(df_df), floor(nrow(df_df)*0.8))
+train <- df_df[idxs, ]
+test <- df_df[-idxs,]
+```
+
+```{r}
+train_scaled <- train
+test_scaled <- test
+```
+
+
+```{r}
+train_scaled[,-c(1,3)] <- scale(train[,-c(1,3)])
+test_scaled[,-c(1,3)] <- scale(test[,-c(1,3)])
+```
+
+Before training our model using cv we can train it using different lambdas and observe the behavior of coefficients.
+
+```{r}
+model_for_plot <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train$value)
+plot(model_for_plot, xvar="lambda", main="model coefficient paths") 
+```
+
+After dividing we can apply the cv process to the training set, which will be divided intro train and validation, to find the best value of lambda for the regression. 
+
+```{r}
+set.seed(123)
+df_cv <- cv.glmnet(as.matrix(train_scaled[,-c(1,3)]), train$value)
+plot(mf_cv, xlim=c(-0,-8), ylim = c(0,10)) #zoom
+```
+
+```{r}
+paste("Lambda 1se:",round(df_cv$lambda.1se,7))
+paste("Lambda min:",round(df_cv$lambda.min,7))
+```
+
+We will go with the lambda_min since it returns the minimum error. 
+
+```{r}
+model <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train_scaled$value, lambda = df_cv$lambda.min, alpha = 1)
+```
+
+After training the model we can make predictions on the test set.
+
+```{r}
+predictions <- predict(model, newx =  as.matrix(test_scaled[,-c(1,3)]))
+mse <- mean((predictions - test$value)^2)
+mae <- mean(abs(predictions - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+We can now observe all the coefficients our model, trained with lambda.min, leaves different from 0. 
+
+```{r}
+a <- rownames(coef(df_cv, s = 'lambda.min'))[coef(df_cv, s = 'lambda.min')[,1]!= 0] ### returns nonzero coefs
+```
+```{r}
+b <- coef(df_cv, s = 'lambda.min')[coef(df_cv, s = 'lambda.min')[,1]!= 0] ### returns nonzero coefs
+```
+```{r}
+coefs_df <- data.frame(Column1 = a, Column2 = b)
+```
+
+```{r}
+lmbda <- df_cv$lambda.1se
+lmbda1 <- df_cv$lambda.min
+plt <- cbind(test$value, predict(object=df_cv, newx=as.matrix(test_scaled[,-c(1,3)])), predict(object=df_cv, newx=as.matrix(test_scaled[,-c(1,3)]), s=lmbda1), type='link')
+matplot(plt, main="Predicted vs Actual", type='l', lwd=2, 
+        ylab="Value",
+        xlab="Players",
+        col = c("#000000", "#009490", "#BDC2C5"),
+)
+grid()
+legend("bottomright", legend=c("Actual","Fitted-1se","Fitted-min"), fill=c("#000000", "#009490", "#BDC2C5"), bty="n", cex=0.7)
+```
+
+
+### L2 regularization
+
+```{r}
+model_for_plot_l2 <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train$value, alpha = 0)
+plot(model_for_plot_l2, xvar="lambda", main="model coefficient paths - L2") 
+```
+
+```{r}
+set.seed(123)
+mf_cv_l2 <- cv.glmnet(as.matrix(train_scaled[,-c(1,3)]), train$value, alpha = 0)
+plot(mf_cv_l2)
+```
+
+```{r}
+paste("Lambda 1se:",round(mf_cv_l2$lambda.1se,7))
+paste("Lambda min:",round(mf_cv_l2$lambda.min,7))
+```
+
+We will go with the lambda_min since it returns the minimum error. 
+
+```{r}
+model_l2 <- glmnet(as.matrix(train_scaled[,-c(1,3)]),train_scaled$value, lambda = mf_cv_l2$lambda.min, alpha = 0)
+```
+
+After training the model we can make predictions on the test set.
+
+```{r}
+predictions_l2 <- predict(model_l2, newx =  as.matrix(test_scaled[,-c(1,3)]))
+mse <- mean((predictions_l2 - test$value)^2)
+mae <- mean(abs(predictions_l2 - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_l2)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+
+## PCA
+We can try another way to make inference on our data, by reducing dimension of our problem using the PCA. 
+
+```{r}
+pca_result <- prcomp(train[,-c(1,3)], scale = TRUE)
+train_pca <- predict(pca_result, newdata = train[,-c(1,3)])
+
+# Scree plot
+scree_data <- cumsum(pca_result$sdev^2) / sum(pca_result$sdev^2)*100
+```
+
+
+```{r}
+for(i in 1:length(scree_data)){
+  if (scree_data[i]>95){
+    line_95_h <- scree_data[i]
+    line_95_v <- i
+    break
+  }
+}
+
+for(i in 1:length(scree_data)){
+  if (scree_data[i]>90){
+    line_90_h <- scree_data[i]
+    line_90_v <- i
+    break
+  }
+}
+
+# Create a scree plot
+scree_plot <- ggplot(data.frame(PC = 1:length(scree_data), ExplainedVariance = scree_data),
+                     aes(x = PC, y = ExplainedVariance)) +
+  geom_bar(stat = "identity", fill = "skyblue", width = 0.7) +
+  geom_line(color = "red") +
+  labs(title = "Scree Plot",
+       x = "Principal Component",
+       y = "Explained Variance") +
+  theme_minimal() + 
+geom_segment(
+    aes(x = line_95_v, y = -Inf, xend = line_95_v, yend = line_95_h),
+    linetype = "dashed", color = "red", linewidth = 0.5
+  )+
+  geom_segment(
+    aes(x = -Inf, y = line_95_h, xend = line_95_v, yend = line_95_h),
+    linetype = "dashed", color = "red", linewidth = 0.5
+  )+ 
+geom_segment(
+    aes(x = line_90_v, y = -Inf, xend = line_90_v, yend = line_90_h),
+    linetype = "dashed", color = "black", linewidth = 0.5
+  )+
+  geom_segment(
+    aes(x = -Inf, y = line_90_h, xend = line_90_v, yend = line_90_h),
+    linetype = "dashed", color = "black", linewidth = 0.5
+  )
+  
+
+print(scree_plot)
+```
+We can select the number of principal components based on the amount of variance explained.
+```{r}
+paste("PC for a 90% variance:",line_90_v)
+paste("PC for a 95% variance:",line_95_v)
+```
+We can select the number of componenets to be equal to 79, explaining 95% of the variance. Now that we have reduced the dimension of our problem by appying the pca
+
+```{r}
+num_components <- line_95_v
+selected_components <- train_pca[, 1:num_components]
+```
+
+```{r}
+model_95 <- lm(train$value~., data = data.frame(selected_components))
+plot(model_95)
+```
+We can now prepare the test set in the same way we prepared our training to test the performances of our model. 
+
+```{r}
+test_pca <- predict(pca_result, newdata = test[,-c(1,3)])[, 1:num_components]
+predictions_pca <- predict(model_95, newdata = data.frame(test_pca))
+mse <- mean((predictions_pca - test$value)^2)
+mae <- mean(abs(predictions_pca - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_pca)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+We can try the same approach with fewer components
+```{r}
+num_components <- line_90_v
+selected_components <- train_pca[, 1:num_components]
+```
+
+```{r}
+model_90 <- lm(train$value~., data = data.frame(selected_components))
+plot(model_90)
+```
+
+```{r}
+test_pca <- predict(pca_result, newdata = test[,-c(1,3)])[, 1:num_components]
+predictions_pca <- predict(model_90, newdata = data.frame(test_pca))
+mse <- mean((predictions_pca - test$value)^2)
+mae <- mean(abs(predictions_pca - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_pca)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+We can see how it performs better with more principal componenets.
+
+
+
+### Sparse PCA
+
+We can introduce the concept of sparsity also in the PCA.
+```{r}
+var.sp<- NULL
+alphas<- seq(0,0.15, length=20)
+j<-1
+for(i in alphas){
+  fit <- spca(train[,-c(1,3)], k=line_95_v, alpha= i,  scale=TRUE, verbose=F)
+  var.sp[j]<-sum(fit$sdev^2)
+  print(c(i, sum(fit$sdev^2)))	
+  j<-j+1
+}
+par(mfrow=c(1,1))
+plot(alphas, var.sp, type="l", xlab=expression(lambda[1]), ylab="Explained variance", lwd=2)
+abline(v = alphas[4], col = "red")
+```
+
+```{r}
+fit <- spca(train[,-c(1,3)], k=line_95_v, alpha= alphas[4],   scale=TRUE, verbose=F)
+
+V <- fit$loadings
+
+pcData <- as.data.frame(scale(train[,-c(1,3)]) %*% V)
+m1 <- lm(train$value~., pcData)
+#library(hdrm)
+#CIplot(m1, tau=c(-1,-1,-1,-1,-1), sort=FALSE, xlab=expression(beta))
+```
+
+```{r}
+plot(m1)
+```
+
+```{r}
+fit_test <- spca(test[,-c(1,3)], k=line_95_v, alpha= alphas[4],   scale=TRUE, verbose=F)
+V_test <- fit_test$loadings
+pcTest <- as.data.frame(scale(test[,-c(1,3)]) %*% V_test)
+
+
+predictions <- predict(m1, newdata = pcTest)
+mse <- mean((predictions - test$value)^2)
+mae <- mean(abs(predictions - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+
+
+
+### Groups
+
+We can now try the grouped-lasso regression algorithm, dividing our variables into 23 different categories
+```{r}
+train_players <- train_scaled$player
+test_players <- test_scaled$player
+
+
+train_y <- train_scaled$value
+test_y <- test_scaled$value
+
+train_scaled <- train_scaled[,-c(1,3)]
+
+test_scaled <- test_scaled[,-c(1,3)]
+```
+
+```{r}
+reference <- c('pen'= 1, 'goal'= 2, 'pass'= 3,'x'= 4,'sca'= 5,'gca'= 6,'shot'= 7,'touch'= 8,'tackle'= 9,'cross'= 10,'dribble'= 11,'distance'= 12, "continent" = 13, "league" = 13, "age" = 13,"height" = 13, foot = "13","aerials"=14,"pressure"=15,"cards"=16,"corner"=17,"assist" = 18,"through_balls"=18, "minutes" = 19,"games_started_pct"=19,"D"=20,"Pts"=20,"CL"=20,"WinCL"=20, "foul" = 21,"blocks"=22,"interceptions"=22,"clearances"=22,"throw_ins"=22, "miscontrols"=22,"ball_recoveries"=22,"errors"=23, "nutmegs"=23, "dispossessed"=23,"offsides"=23, "own_goal" = 23)
+groups <- rep(0, dim(train_scaled)[2])
+```
+
+We can now create the vector of groups
+
+```{r}
+idx <- 1
+
+for (col in colnames(train_scaled)){
+  for (key in names(reference)){
+    if (grepl(key,col)){
+      groups[idx] <- reference[key]
+    }
+  }
+  idx <- idx + 1
+}
+```
+
+convert it into integers
+
+```{r}
+groups_int <- c()
+for (i in groups){
+  groups_int <- c(groups_int, as.integer(i))
+}
+```
+
+re-order columns accordingly to the group they belong: the algorithm requires the groups to be sequential
+
+```{r}
+new_cols <- c()
+for (i in 1:23){
+  idx <- 1
+  for (col in colnames(train_scaled)){
+    if (groups[idx] == i){
+      new_cols <- c(new_cols,col)
+    }
+    idx <- idx + 1
+  }
+}
+```
+
+```{r}
+train_scaled <- train_scaled[,new_cols]
+test_scaled <- test_scaled[,new_cols]
+```
+
+```{r}
+groups_int <- sort(groups_int)
+```
+
+### General
+```{r}
+geenral_group <- gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls')
+coef.mat=geenral_group$beta
+#
+plot(geenral_group)
+
+behavior <- c()
+for(i in 1:23){
+  idx <- match(i, groups_int)
+  behavior <- c(behavior,max(which(coef.mat[idx,]==0)))
+}
+
+100 - behavior
+```
+
+In the behavior vector we can observe the number of models in which each group is active.
+
+After it we can apply cross validation to find the best value of lambda
+```{r}
+cv.group <- cv.gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls', nfolds = 10)
+plot(cv.group)
+```
+
+```{r}
+group_model <- gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls', lambda = cv.group$lambda.1se)
+group_model2 <- gglasso(x=as.matrix(train_scaled), y=train_y, group=groups_int, loss='ls', lambda = cv.group$lambda.min)
+```
+
+```{r}
+coef_min <- rownames(coef(cv.group, s = 'lambda.min'))[coef(cv.group, s = 'lambda.min')[,1]!= 0]
+coef_1se <- rownames(coef(cv.group, s = 'lambda.1se'))[coef(cv.group, s = 'lambda.1se')[,1]!= 0]
+setdiff(coef_min, coef_1se)
+```
+
+```{r}
+predictions_group <- predict(object = group_model2, newx = test_scaled)
+mse <- mean((predictions_group - test$value)^2)
+mae <- mean(abs(predictions_group - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions_group)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+## NN
+
+```{r}
+
+model <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = ncol(train_scaled), kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 32, activation = "relu", kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 1)  # Output layer for regression
+
+custom_learning_rate <- 0.01
+
+# Compile the model with the Adam optimizer and custom learning rate
+model %>% compile(
+  loss = "mean_squared_error",
+  optimizer = optimizer_adam(learning_rate = custom_learning_rate),
+  metrics = c("mean_absolute_error")
+)
+
+history <- model %>%
+  fit(
+    x = as.matrix(train_scaled),
+    y = train_y,
+    epochs = 250,
+    batch_size = 32,
+    validation_split = 0.2,
+  )
+```
+
+```{r}
+predictions <- predict(model, as.matrix(test_scaled))
+mse <- mean((predictions - test$value)^2)
+mae <- mean(abs(predictions - test$value))
+rmse <- sqrt(mse)
+r_squared <- cor(test$value, predictions)^2
+
+paste("The mean squared error is",round(mse,4))
+paste("The mean absolute error is",round(mae,4))
+paste("The rmse is",round(rmse,4))
+paste("The R^2 is",round(r_squared,4))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
